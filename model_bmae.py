@@ -1,146 +1,125 @@
-# implementation of bootstrappted mae
-# main idea: maintain a shadow model
-# 1.w/o EMA
-#   * 1.1 first args.epochs/args.bootstrap_k epochs train the same as mae
-#   * 1.2 then the labels should be the output of the encoder of the shadow model
-# 2.w/ EMA
-#   * 2.1 first K epochs train the same as mae,K as a hyper parameter
-#   * 2.2 then each epoch we update the shadow model and the label is the output of encoder of shadow model
-# 3.the last proj layer of decoder should be changed when needed,
-#       i.e. Linear(decoder_embed,p*p*channel)-> Linear(decoder_embed,encoder_embed)
-
 from functools import partial
-
 import torch
 import torch.nn as nn
 import copy
-from timm.models.vision_transformer import PatchEmbed, Block
+from timm.models.vision_transformer import Block, PatchEmbed
 
 from util.pos_embed import get_2d_sincos_pos_embed
 from models_mae import MaskedAutoencoderViT
 
 
-class BootstrappedMaskedAutoencoderViT(MaskedAutoencoderViT):
+class BootstrapMAE(MaskedAutoencoderViT):
     def __init__(self, **kwargs):
-        super(BootstrappedMaskedAutoencoderViT, self).__init__(**kwargs)
+        super().__init__(**kwargs)
 
-        # Linear(decoder_embed,encoder_embed)
-        self.decoder_last_proj = nn.Linear(kwargs['decoder_embed_dim'], kwargs['embed_dim'], bias=True)
-        torch.nn.init.xavier_normal_(self.decoder_last_proj.weight)
-        if self.decoder_last_proj.bias is not None:
-            nn.init.constant_(self.decoder_last_proj.bias, 0)
+        # Projection layer adaptation for feature prediction
+        self.feat_projection = nn.Linear(kwargs['decoder_embed_dim'], kwargs['embed_dim'])
+        nn.init.xavier_normal_(self.feat_projection.weight)
+        if self.feat_projection.bias is not None:
+            nn.init.zeros_(self.feat_projection.bias)
 
-        self.shadow = {}  # shadow model
-        # process ema
-        assert 'enable_ema' in kwargs.keys()
-        self.enable_ema = kwargs['enable_ema']
-        if self.enable_ema:
-            self.ema_warmup_epochs = kwargs['ema_warmup_epochs']
-            self.ema_register()
-            self.ema_alpha = kwargs['ema_alpha']
-            self.now_epoch = 0
+        self.teacher = {}  # Teacher model parameters
+        self.ema_enabled = kwargs.get('enable_ema', False)
+        if self.ema_enabled:
+            self.ema_init_epochs = kwargs['ema_warmup_epochs']
+            self._init_teacher_weights()
+            self.ema_momentum = kwargs['ema_alpha']
+            self.current_epoch = 0
 
-    def ema_register(self):  # shadow_model in ema
-        self.shadow['patch_embed'] = copy.deepcopy(self.patch_embed).cuda()
-        self.shadow['cls_token'] = copy.deepcopy(self.cls_token).cuda()
-        self.shadow['pos_embed'] = copy.deepcopy(self.pos_embed).cuda()
-        self.shadow['blocks'] = copy.deepcopy(self.blocks).cuda()
-        self.shadow['norm'] = copy.deepcopy(self.norm).cuda()
+    def _init_teacher_weights(self):
+        """Initialize teacher model with current weights"""
+        components = ['patch_embed', 'cls_token', 'pos_embed', 'blocks', 'norm']
+        for comp in components:
+            self.teacher[comp] = copy.deepcopy(getattr(self, comp)).cuda()
 
-    def ema_update_module(self, shadow_module, new_module):
-        if isinstance(shadow_module, nn.Module):
-            assert isinstance(new_module, nn.Module)
-            for shadow_param, new_param in zip(shadow_module.parameters(), new_module.parameters()):
-                new_average = (1.0 - self.ema_alpha) * new_param.data + self.ema_alpha * shadow_param.data
-                shadow_param.data.copy_(new_average)
-        else:
-            assert isinstance(shadow_module, torch.Tensor)
-            assert isinstance(new_module, torch.Tensor)
-            new_average = (1.0 - self.ema_alpha) * new_module.data + self.ema_alpha * shadow_module.data
-            shadow_module.copy_(new_average)
+    def _update_teacher_component(self, teacher_comp, model_comp):
+        """EMA update for individual components"""
+        if isinstance(teacher_comp, nn.Module):
+            for t_param, m_param in zip(teacher_comp.parameters(), model_comp.parameters()):
+                t_param.data.mul_(self.ema_momentum).add_(m_param.data, alpha=1 - self.ema_momentum)
+        else:  # Handle tensors (pos_embed, cls_token)
+            teacher_comp.data = teacher_comp.data * self.ema_momentum + model_comp.data * (1 - self.ema_momentum)
 
-    def ema_update(self):
-        self.ema_update_module(self.shadow['patch_embed'], self.patch_embed)
-        self.ema_update_module(self.shadow['cls_token'], self.cls_token)
-        self.ema_update_module(self.shadow['pos_embed'], self.pos_embed)
-        self.ema_update_module(self.shadow['blocks'], self.blocks)
-        self.ema_update_module(self.shadow['norm'], self.norm)
+    def update_teacher(self):
+        """Update teacher model weights using EMA"""
+        components = ['patch_embed', 'cls_token', 'pos_embed', 'blocks', 'norm']
+        for comp in components:
+            self._update_teacher_component(self.teacher[comp], getattr(self, comp))
 
-    def bmae_decoder_forward(self, x, ids_restore):
-        x = self.decoder_embed(x)
-        mask_tokens = self.mask_token.repeat(x.shape[0], ids_restore.shape[1] + 1 - x.shape[1], 1)
-        x_ = torch.cat([x[:, 1:, :], mask_tokens], dim=1)  # no cls token
-        x_ = torch.gather(x_, dim=1, index=ids_restore.unsqueeze(-1).repeat(1, 1, x.shape[2]))  # unshuffle
-        x = torch.cat([x[:, :1, :], x_], dim=1)  # append cls token
-        x = x + self.decoder_pos_embed
+    def feature_decoder_forward(self, latent, restore_ids):
+        """Decoder forward pass for feature prediction"""
+        x = self.decoder_embed(latent)
+
+        # Generate mask tokens and reconstruct full sequence
+        num_masked = restore_ids.shape[1] + 1 - x.shape[1]
+        mask_tokens = self.mask_token.expand(x.size(0), num_masked, -1)
+        x_body = torch.cat([x[:, 1:], mask_tokens], dim=1)
+
+        # Restore original patch order
+        x_body = torch.gather(x_body, 1, restore_ids.unsqueeze(-1).expand(-1, -1, x.size(2)))
+        x = torch.cat([x[:, :1], x_body], dim=1)
+
+        # Process through decoder
+        x += self.decoder_pos_embed
         for blk in self.decoder_blocks:
             x = blk(x)
         x = self.decoder_norm(x)
-        # simply replace the last linear layer or w/o linear proj
-        # experiment results suggest w/o linear proj is better
-        # x = self.decoder_last_proj(x)
+        return x[:, 1:]  # Remove CLS token
 
-        x = x[:, 1:, :]
-        return x
+    def get_teacher_features(self, images):
+        """Get encoded features from teacher model"""
+        patches = self.teacher['patch_embed'](images)
+        patches += self.teacher['pos_embed'][:, 1:]
 
-    def bmae_shadow_encoder_forward(self, x):  # don't need to mask
-        x = self.shadow['patch_embed'](x)
-        x = x + self.shadow['pos_embed'][:, 1:, :]
-        cls_token = self.shadow['cls_token'] + self.shadow['pos_embed'][:, :1, :]
-        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)
-        for blk in self.shadow['blocks']:
+        # Add CLS token
+        cls_token = self.teacher['cls_token'] + self.teacher['pos_embed'][:, :1]
+        cls_tokens = cls_token.expand(patches.size(0), -1, -1)
+        x = torch.cat([cls_tokens, patches], dim=1)
+
+        # Process through transformer
+        for blk in self.teacher['blocks']:
             x = blk(x)
-        x = self.shadow['norm'](x)
+        return self.teacher['norm'](x)
 
-        return x
-
-    def bmae_encoder_forward_loss(self, target, pred, mask):
-        """
-        target: [N, L, embed_dim]
-        pred: [N, L , embed_dim]
-        mask: [N, L], 0 is keep, 1 is remove,
-        """
+    def feature_prediction_loss(self, teacher_feats, pred_feats, mask):
+        """Calculate feature reconstruction loss"""
         if self.norm_pix_loss:
-            mean = target.mean(dim=-1, keepdim=True)
-            var = target.var(dim=-1, keepdim=True)
-            target = (target - mean) / (var + 1.e-6) ** .5
+            teacher_feats = (teacher_feats - teacher_feats.mean(-1, keepdim=True)) / (
+                    teacher_feats.var(-1, keepdim=True, unbiased=False) + 1e-6).sqrt()
+        return (mask * (pred_feats - teacher_feats).pow(2).mean(-1)).sum() / mask.sum()
 
-        loss = (pred - target) ** 2
-        loss = loss.mean(dim=-1)  # [N, L], mean loss per patch
+    def track_epoch(self):
+        """Update epoch counter for EMA scheduling"""
+        self.current_epoch += 1
 
-        loss = (loss * mask).sum() / mask.sum()  # mean loss on removed patches
-        return loss
+    def forward(self, inputs, mask_ratio=0.75):
+        """Main forward pass with mode switching"""
+        if self.ema_enabled:
+            self.update_teacher()
 
-    def update_epoch(self):
-        self.now_epoch += 1
+        # Determine training phase
+        teacher_active = (self.ema_enabled and self.current_epoch >= self.ema_init_epochs) or (
+                not self.ema_enabled and self.teacher)
 
-    def forward(self, imgs, mask_ratio=0.75):
-        if self.enable_ema:
-            self.ema_update()
-        if (self.enable_ema and self.now_epoch >= self.ema_warmup_epochs) or \
-                (not self.enable_ema and self.shadow):
-            # reconstruct encoder
-            latent, mask, ids_restore = self.forward_encoder(imgs, mask_ratio)
-            pred = self.bmae_decoder_forward(latent, ids_restore)
-            shadow_encoder_out = self.bmae_shadow_encoder_forward(imgs)
-            loss = self.bmae_encoder_forward_loss(shadow_encoder_out[:, 1:, :], pred, mask)
-            return loss, pred, mask
+        if teacher_active:
+            # Feature prediction mode
+            latent, mask, restore_ids = self.forward_encoder(inputs, mask_ratio)
+            pred_features = self.feature_decoder_forward(latent, restore_ids)
+            with torch.no_grad():
+                target_features = self.get_teacher_features(inputs)
+            loss = self.feature_prediction_loss(target_features[:, 1:], pred_features, mask)
+            return loss, pred_features, mask
         else:
-            # reconstruct normalized pixel
-            return super(BootstrappedMaskedAutoencoderViT, self).forward(imgs, mask_ratio)
+            # Pixel reconstruction mode
+            return super().forward(inputs, mask_ratio)
 
-    def update_shadow(self):  # BMAE_K
-        self.shadow['patch_embed'] = copy.deepcopy(self.patch_embed).cuda()
-        self.shadow['cls_token'] = copy.deepcopy(self.cls_token).cuda()
-        self.shadow['pos_embed'] = copy.deepcopy(self.pos_embed).cuda()
-        self.shadow['blocks'] = copy.deepcopy(self.blocks).cuda()
-        self.shadow['norm'] = copy.deepcopy(self.norm).cuda()
+    def sync_teacher(self):
+        """Full weight copy for non-EMA mode"""
+        self._init_teacher_weights()
 
 
 def deit_tiny(**kwargs):
-    model = BootstrappedMaskedAutoencoderViT(
+    return BootstrapMAE(
         img_size=32, patch_size=4, embed_dim=192, depth=12, num_heads=3,
         decoder_embed_dim=192, decoder_depth=8, decoder_num_heads=3,
-        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-12), **kwargs)
-    return model
+        mlp_ratio=4, norm_layer=partial(nn.LayerNorm, eps=1e-6), **kwargs)
