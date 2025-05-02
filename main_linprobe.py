@@ -19,13 +19,12 @@ from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
+#from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
 import timm
 
-assert timm.__version__ == "0.3.2" # version check
 from timm.models.layers import trunc_normal_
 
 import util.misc as misc
@@ -39,6 +38,7 @@ import models_vit
 from engine_finetune import train_one_epoch, evaluate
 
 
+# change dataset
 def get_args_parser():
     parser = argparse.ArgumentParser('MAE linear probing for image classification', add_help=False)
     parser.add_argument('--batch_size', default=512, type=int,
@@ -128,19 +128,24 @@ def main(args):
 
     cudnn.benchmark = True
 
+    cifar10_mean = [0.4914, 0.4822, 0.4465]
+    cifar10_std = [0.2023, 0.1994, 0.2010]
     # linear probe: weak augmentation
+
+    # fixme: change transforms
     transform_train = transforms.Compose([
-            RandomResizedCrop(224, interpolation=3),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
+        RandomResizedCrop(32, interpolation=3),
+        transforms.RandomHorizontalFlip(),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=cifar10_mean, std=cifar10_std)])
     transform_val = transforms.Compose([
-            transforms.Resize(256, interpolation=3),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
-    dataset_val = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform_val)
+        transforms.ToTensor(),
+        transforms.Normalize(mean=cifar10_mean, std=cifar10_std)])
+    dataset_train = datasets.CIFAR10(root=args.data_path, train=True, transform=transform_train, download=False)
+    dataset_val = datasets.CIFAR10(root=args.data_path, train=False, transform=transform_val, download=False)
+    # dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+    # dataset_val = datasets.ImageFolder(os.path.join(args.data_path, 'val'), transform=transform_val)
+
     print(dataset_train)
     print(dataset_val)
 
@@ -157,7 +162,8 @@ def main(args):
                       'This will slightly alter validation results as extra duplicate entries are added to achieve '
                       'equal num of samples per-process.')
             sampler_val = torch.utils.data.DistributedSampler(
-                dataset_val, num_replicas=num_tasks, rank=global_rank, shuffle=True)  # shuffle=True to reduce monitor bias
+                dataset_val, num_replicas=num_tasks, rank=global_rank,
+                shuffle=True)  # shuffle=True to reduce monitor bias
         else:
             sampler_val = torch.utils.data.SequentialSampler(dataset_val)
     else:
@@ -166,7 +172,9 @@ def main(args):
 
     if global_rank == 0 and args.log_dir is not None and not args.eval:
         os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
+        log_writer = None
+
+        #log_writer = SummaryWriter(log_dir=args.log_dir)
     else:
         log_writer = None
 
@@ -235,7 +243,7 @@ def main(args):
     print('number of params (M): %.2f' % (n_parameters / 1.e6))
 
     eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
-    
+
     if args.lr is None:  # only base_lr is specified
         args.lr = args.blr * eff_batch_size / 256
 
@@ -277,10 +285,10 @@ def main(args):
             log_writer=log_writer,
             args=args
         )
-        if args.output_dir:
-            misc.save_model(
-                args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
-                loss_scaler=loss_scaler, epoch=epoch)
+        # if args.output_dir:
+        #     misc.save_model(
+        #         args=args, model=model, model_without_ddp=model_without_ddp, optimizer=optimizer,
+        #         loss_scaler=loss_scaler, epoch=epoch)
 
         test_stats = evaluate(data_loader_val, model, device)
         print(f"Accuracy of the network on the {len(dataset_val)} test images: {test_stats['acc1']:.1f}%")
@@ -293,9 +301,9 @@ def main(args):
             log_writer.add_scalar('perf/test_loss', test_stats['loss'], epoch)
 
         log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        **{f'test_{k}': v for k, v in test_stats.items()},
-                        'epoch': epoch,
-                        'n_parameters': n_parameters}
+                     **{f'test_{k}': v for k, v in test_stats.items()},
+                     'epoch': epoch,
+                     'n_parameters': n_parameters}
 
         if args.output_dir and misc.is_main_process():
             if log_writer is not None:

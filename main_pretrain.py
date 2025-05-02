@@ -18,19 +18,20 @@ from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
-from torch.utils.tensorboard import SummaryWriter
+#from torch.utils.tensorboard import SummaryWriter
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 
 import timm
 
-assert timm.__version__ == "0.3.2"  # version check
+#assert timm.__version__ == "0.3.2"  # version check
 import timm.optim.optim_factory as optim_factory
 
 import util.misc as misc
 from util.misc import NativeScalerWithGradNormCount as NativeScaler
 
 import models_mae
+import model_bmae
 
 from engine_pretrain import train_one_epoch
 
@@ -55,6 +56,17 @@ def get_args_parser():
 
     parser.add_argument('--norm_pix_loss', action='store_true',
                         help='Use (per-patch) normalized pixels as targets for computing loss')
+    parser.add_argument('--bmae_k', default=1, type=int,
+                        help='mae_k, 1 for simple mae')
+    parser.add_argument('--ema_alpha', default=0.99, type=float,
+                        help='ema parameter')
+    parser.add_argument('--enable_ema', action='store_true', default=False,
+                        help='enable ema in bootstrapped MAE')
+    parser.add_argument('--enable_bootstrap', action='store_true', default=False,
+                        help='enable bootstrapped MAE')
+    parser.add_argument('--ema_warmup_epochs', default=0, type=int,
+                        help='warm up before bootstrapped MAE with ema')
+
     parser.set_defaults(norm_pix_loss=False)
 
     # Optimizer parameters
@@ -119,13 +131,18 @@ def main(args):
 
     cudnn.benchmark = True
 
+    # cifar_10 mean and std 可以更改
+    cifar10_mean = [0.4914, 0.4822, 0.4465]
+    cifar10_std = [0.2023, 0.1994, 0.2010]
+    # -------
+
     # simple augmentation
     transform_train = transforms.Compose([
             transforms.RandomResizedCrop(args.input_size, scale=(0.2, 1.0), interpolation=3),  # 3 is bicubic
             transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-    dataset_train = datasets.ImageFolder(os.path.join(args.data_path, 'train'), transform=transform_train)
+            transforms.Normalize(mean=cifar10_mean, std=cifar10_std)])
+    dataset_train = datasets.CIFAR10(root=args.data_path, train=True, transform=transform_train, download=False)
     print(dataset_train)
 
     if True:  # args.distributed:
@@ -140,7 +157,7 @@ def main(args):
 
     if global_rank == 0 and args.log_dir is not None:
         os.makedirs(args.log_dir, exist_ok=True)
-        log_writer = SummaryWriter(log_dir=args.log_dir)
+        log_writer = None
     else:
         log_writer = None
 
@@ -153,8 +170,15 @@ def main(args):
     )
     
     # define the model
-    model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
-
+    if args.enable_bootstrap:
+        model = model_bmae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss,enable_ema = args.enable_ema,
+                                                    ema_warmup_epochs=args.ema_warmup_epochs,ema_alpha=args.ema_alpha)
+        print('use bootstrapped MAE!')
+        if args.enable_ema:
+            print('ema enabled!')
+    else:
+        model = models_mae.__dict__[args.model](norm_pix_loss=args.norm_pix_loss)
+        print('simple MAE')
     model.to(device)
 
     model_without_ddp = model
@@ -188,6 +212,9 @@ def main(args):
     for epoch in range(args.start_epoch, args.epochs):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
+        if args.enable_bootstrap and not args.enable_ema and (epoch +1)% (args.epochs//args.bmae_k) == 0:
+            print('shadow updated!')
+            model.update_shadow()
         train_stats = train_one_epoch(
             model, data_loader_train,
             optimizer, device, epoch, loss_scaler,
